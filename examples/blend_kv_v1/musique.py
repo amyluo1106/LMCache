@@ -80,7 +80,6 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
 def create_blended_prompt(tokenizer, contexts, question, blend_special_str):
-    """Create a prompt with blended context chunks following the working blend.py pattern."""
     # System prompt (includes BOS token)
     sys_prompt = tokenizer.encode(
         "You will be asked a question after reading several passages. "
@@ -161,7 +160,7 @@ def create_reordered_contexts(contexts):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Demonstrate cache blending on Musique dataset")
+    parser = argparse.ArgumentParser(description="Demonstrate cache blending dataset")
     parser.add_argument(
         "-d",
         "--use-disk",
@@ -172,13 +171,12 @@ def parse_args():
         "-b",
         "--blend-special-str",
         default="# #",
-        # default=" @ @ ",
         help="Specify the special separators to separate chunks (default: '# #')",
     )
     parser.add_argument(
         "--dataset-path",
         default="musique_s.json",
-        help="Path to the musique dataset (default: musique_s.json)",
+        help="Path to dataset (default: musique_s.json)",
     )
     return parser.parse_args()
 
@@ -188,9 +186,9 @@ def main():
     
     # Configuration
     lmcache_connector = "LMCacheConnectorV1"
-    model = "mistralai/Mistral-7B-Instruct-v0.2"
+    # model = "mistralai/Mistral-7B-Instruct-v0.2"
     # model = "mistralai/Mixtral-8x7B-Instruct-v0.1" # doesn't work
-    # model = "meta-llama/Llama-3.1-8B-Instruct" # nonsense tokenizer
+    model = "meta-llama/Llama-3.1-8B-Instruct" # nonsense tokenizer
     # model = "meta-llama/Meta-Llama-3-8B-Instruct" # better but still kind of nonsense
     # model = "meta-llama/Llama-4-Scout-17B-16E-Instruct" # model too big
     
@@ -203,7 +201,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model)
     
     # Select a single example to demonstrate cache blending
-    example = dataset[1]
+    example = dataset[0]
     print(f"Selected example for cache blending demonstration")
     print(f"Question: {example['question']}")
     print(f"Expected answers: {example['answers']}")
@@ -260,7 +258,7 @@ def main():
             tokenizer, 
             reordered_contexts, 
             # original_contexts,
-            example["question"], 
+            example["question"][:-2], 
             args.blend_special_str
         )
         
@@ -295,7 +293,6 @@ def main():
     
     print(f"\nBlend separator used: '{args.blend_special_str}'")
     print(f"Chunk size: {os.environ.get('LMCACHE_CHUNK_SIZE', 'default')} tokens")
-
 
 if __name__ == "__main__":
     main()
