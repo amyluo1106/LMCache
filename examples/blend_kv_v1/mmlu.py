@@ -37,7 +37,7 @@ def build_llm_with_lmcache(model_name, lmcache_connector):
     # Initialize the model with LMCache
     llm = LLM(
         model=model_name,
-        kv_transfer_config=ktc,  # CacheBlend
+        # kv_transfer_config=ktc,  # CacheBlend
         max_model_len=8000,
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
@@ -59,8 +59,8 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 # Load MMLU evaluation details from Llama-3.1-8B-evals
 print("Loading Llama 3.1 MMLU evaluation data...")
 llama_mmlu_data = load_dataset(
-    "meta-llama/Llama-3.1-8B-evals",
-    name="Llama-3.1-8B-evals__mmlu__details",
+    "meta-llama/Llama-3.1-8B-Instruct-evals",
+    name="Llama-3.1-8B-Instruct-evals__mmlu_pro__details",
     split="latest"
 )
 
@@ -71,7 +71,7 @@ print(f"Found {len(all_subjects)} unique subjects in the MMLU dataset")
 # Select 2 subjects
 num_subjects_to_select = 2
 # selected_subjects = random.sample(all_subjects, num_subjects_to_select)
-selected_subjects = ["logical_fallacies", "us_foreign_policy"]
+selected_subjects = ["philosophy", "history"]
 
 print(f"\nSelected {len(selected_subjects)} subjects for evaluation:")
 for subject in selected_subjects:
@@ -86,7 +86,7 @@ for subject in selected_subjects:
     examples_by_subject[subject] = subject_examples
     print(f"  - {subject}: {len(subject_examples)} examples")
 
-def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=1000, show_examples=2):
+def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=200, show_examples=5):
     """Evaluate using Llama's pre-defined prompts with blend separators and tokenized inputs."""
     
     total = min(num_examples, len(subject_examples))
@@ -116,7 +116,8 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=1000,
         
         # Get the correct answer
         correct_answer = example["input_correct_responses"][0] if example["input_correct_responses"] else None
-        answer_match = re.search(r'Answer:\s*([A-D])', correct_answer)
+        # answer_match = re.search(r'Answer:\s*([A-D])', correct_answer)
+        answer_match = re.search(r'Answer:\s*([A-J])', correct_answer)
         if answer_match:
             correct_answer = answer_match.group(1)
 
@@ -198,7 +199,7 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=1000,
         
         prompt_texts.append(raw_prompt_text)  # Keep text for display
         prompt_token_ids_list.append(final_prompt_tokens)  # Store token IDs for model input
-        correct_answers.append(correct_answer)
+        correct_answers.append(correct_answer.strip('"'))
         questions.append(input_question)
         choices_list.append(choices)
         num_shots_list.append(num_shots)
@@ -251,19 +252,34 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=1000,
         
         # Try different parsing approaches
         # 1. Look for "Answer: X" pattern
-        answer_match = re.search(r'Answer:\s*([A-D])', response)
+        # answer_match = re.search(r'Answer:\s*([A-D])', response)
+        # if answer_match:
+        #     parsed_letter = answer_match.group(1)
+        
+        # # 2. Look for standalone A, B, C, or D
+        # elif re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response):
+        #     letter_match = re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response)
+        #     parsed_letter = letter_match.group(1)
+        
+        # # 3. Just take the first letter that is A, B, C, or D in the response
+        # else:
+        #     for char in response:
+        #         if char in "ABCD":
+        #             parsed_letter = char
+        #             break
+        answer_match = re.search(r'Answer:\s*([A-J])', response)
         if answer_match:
             parsed_letter = answer_match.group(1)
         
         # 2. Look for standalone A, B, C, or D
-        elif re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response):
-            letter_match = re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response)
+        elif re.search(r'(?:^|\s|\n|[.,;:])([A-J])(?:$|\s|\n|[.,;:])', response):
+            letter_match = re.search(r'(?:^|\s|\n|[.,;:])([A-J])(?:$|\s|\n|[.,;:])', response)
             parsed_letter = letter_match.group(1)
         
         # 3. Just take the first letter that is A, B, C, or D in the response
         else:
             for char in response:
-                if char in "ABCD":
+                if char in "ABCDEFGHIJ":
                     parsed_letter = char
                     break
         
