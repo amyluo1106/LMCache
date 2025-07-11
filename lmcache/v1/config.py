@@ -112,6 +112,19 @@ class LMCacheEngineConfig:
     # The extra config
     extra_config: Optional[dict] = None
 
+    # By default, all chunks are saved
+    # But in some scenarios, such as reuse, save unfull chunk is unnecessary
+    save_unfull_chunk: bool = True
+
+    # Set timeout(seconds) to improve lmcache stability
+    # when calling get_blocking method in remote backend
+    blocking_timeout_secs: int = 10
+
+    # Optional external lookup client configuration
+    # Supports URI-style format: mooncakestore://<MASTER_ADDRESS>
+    # When set, uses external lookup client instead of regular lookup server
+    external_lookup_client: Optional[str] = None
+
     @staticmethod
     def from_defaults(
         chunk_size: int = 256,
@@ -144,8 +157,12 @@ class LMCacheEngineConfig:
         nixl_enable_gc: Optional[bool] = False,
         audit_actual_remote_url: Optional[str] = None,
         weka_path: Optional[str] = None,
+        gds_path: Optional[str] = None,
         cufile_buffer_size: Optional[int] = None,
         extra_config: Optional[dict] = None,
+        save_unfull_chunk: bool = True,
+        blocking_timeout_secs: int = 10,
+        external_lookup_client: Optional[str] = None,
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         return LMCacheEngineConfig(
@@ -179,8 +196,12 @@ class LMCacheEngineConfig:
             nixl_enable_gc,
             audit_actual_remote_url,
             weka_path,
+            gds_path,
             cufile_buffer_size,
             extra_config,
+            save_unfull_chunk,
+            blocking_timeout_secs,
+            external_lookup_client,
         ).validate()
 
     @staticmethod
@@ -200,6 +221,7 @@ class LMCacheEngineConfig:
         lookup_url: Optional[str] = None,
         distributed_url: Optional[str] = None,
         error_handling: bool = False,
+        save_unfull_chunk: bool = True,
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         if backend == "cpu":
@@ -211,13 +233,13 @@ class LMCacheEngineConfig:
         elif backend == "local_disk":
             local_cpu = False
             max_local_cpu_size = 5
-            local_disk = "/local/disk_test/local_disk/"
+            local_disk = "local/disk_test/local_disk/"
             max_local_disk_size = 5
             remote_url = None
         elif backend == "local_cpu_disk":
             local_cpu = True
             max_local_cpu_size = 5
-            local_disk = "/local/disk_test/local_disk/"
+            local_disk = "local/disk_test/local_disk/"
             max_local_disk_size = 5
             remote_url = None
         elif backend == "remote":
@@ -231,34 +253,35 @@ class LMCacheEngineConfig:
         elif backend == "local_disk_remote":
             local_cpu = False
             max_local_cpu_size = 5
-            local_disk = "/local/disk_test/local_disk/"
+            local_disk = "local/disk_test/local_disk/"
             max_local_disk_size = 5
         elif backend == "local_cpu_disk_remote":
             local_cpu = True
             max_local_cpu_size = 5
-            local_disk = "/local/disk_test/local_disk/"
+            local_disk = "local/disk_test/local_disk/"
             max_local_disk_size = 5
         else:
             raise ValueError(f"Invalid backend: {backend}")
         return (
             LMCacheEngineConfig(
-                chunk_size,
-                local_cpu,
-                max_local_cpu_size,
-                local_disk,
-                max_local_disk_size,
-                remote_url,
-                remote_serde,
-                use_layerwise,
-                save_decode_cache,
-                enable_blending,
-                blend_recompute_ratio,
-                blend_min_tokens,
-                blend_special_str,
-                enable_p2p,
-                lookup_url,
-                distributed_url,
-                error_handling,
+                chunk_size=chunk_size,
+                local_cpu=local_cpu,
+                max_local_cpu_size=max_local_cpu_size,
+                local_disk=local_disk,
+                max_local_disk_size=max_local_disk_size,
+                remote_url=remote_url,
+                remote_serde=remote_serde,
+                use_layerwise=use_layerwise,
+                save_decode_cache=save_decode_cache,
+                enable_blending=enable_blending,
+                blend_recompute_ratio=blend_recompute_ratio,
+                blend_min_tokens=blend_min_tokens,
+                blend_special_str=blend_special_str,
+                enable_p2p=enable_p2p,
+                lookup_url=lookup_url,
+                distributed_url=distributed_url,
+                error_handling=error_handling,
+                save_unfull_chunk=save_unfull_chunk,
             )
             .validate()
             .log_config()
@@ -340,6 +363,12 @@ class LMCacheEngineConfig:
         gds_path = config.get("gds_path", None)
         cufile_buffer_size = config.get("cufile_buffer_size", None)
 
+        save_unfull_chunk = config.get("save_unfull_chunk", True)
+
+        blocking_timeout_secs = config.get("blocking_timeout_secs", 10)
+
+        external_lookup_client = config.get("external_lookup_client", None)
+
         local_disk_path = _parse_local_disk(local_disk)
 
         match remote_url:
@@ -385,6 +414,9 @@ class LMCacheEngineConfig:
                 gds_path,
                 cufile_buffer_size,
                 extra_config,
+                save_unfull_chunk,
+                blocking_timeout_secs,
+                external_lookup_client,
             )
             .validate()
             .log_config()
@@ -566,6 +598,17 @@ class LMCacheEngineConfig:
             )
         )
         config.extra_config = to_dict(parse_env(get_env_name("extra_config"), None))
+        config.save_unfull_chunk = to_bool(
+            parse_env(get_env_name("save_unfull_chunk"), config.save_unfull_chunk)
+        )
+        config.blocking_timeout_secs = to_int(
+            parse_env(
+                get_env_name("blocking_timeout_secs"), config.blocking_timeout_secs
+            )
+        )
+        config.external_lookup_client = parse_env(
+            get_env_name("external_lookup_client"), config.external_lookup_client
+        )
         return config.validate().log_config()
 
     def to_original_config(self) -> orig_config.LMCacheEngineConfig:
@@ -647,6 +690,9 @@ class LMCacheEngineConfig:
             "weka_path": self.weka_path,
             "gds_path": self.gds_path,
             "extra_config": self.extra_config,
+            "save_unfull_chunk": self.save_unfull_chunk,
+            "blocking_timeout_secs": self.blocking_timeout_secs,
+            "external_lookup_client": self.external_lookup_client,
         }
         logger.info(f"LMCache Configuration: {config_dict}")
 

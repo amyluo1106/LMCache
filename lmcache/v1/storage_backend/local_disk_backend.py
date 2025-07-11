@@ -192,6 +192,14 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         return future
 
+    def batched_submit_put_task(
+        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+    ) -> Optional[List[Future]]:
+        return [
+            self.submit_put_task(key, memory_obj)
+            for key, memory_obj in zip(keys, memory_objs, strict=False)
+        ]
+
     def submit_prefetch_task(
         self,
         key: CacheEngineKey,
