@@ -613,6 +613,11 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, MemoryFormat.KV_2TD
         )
+
+        # add some logic to reset blend separator token positions in gpu buffer tensor to be 0
+        for i in range(len(ends) - 1):
+            load_gpu_buffer_obj.tensor[:, ends[i] - buf_offset : starts[i+1] - buf_offset] = 0
+
         assert compute_gpu_buffer_obj is not None, (
             "Failed to allocate GPU buffer in GPUConnector"
         )

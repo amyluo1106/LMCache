@@ -50,6 +50,7 @@ class LMCBlender:
         self.common_metadata = LMCBlendCommonMetadata(
             check_layers=[1],
             recomp_ratios=[0.15],
+            # recomp_ratios=[0.3],
             thresholds=None,
         )
 
@@ -135,7 +136,6 @@ class LMCBlender:
         """
 
         # TODO(Jiayi): store is currently not included in this function
-
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 

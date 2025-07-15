@@ -17,3 +17,5 @@ at the end of the function `def load_model`.
 - `python blend.py` - CacheBlend with CPU as backend
 ## Disk offloading
 - `python blend.py --use-disk` - CachBlend with local disk as backend
+## w/ Musique Dataset
+- `python blend_musique.py --num-examples 5` - CacheBlend through Musique Dataset (can specify num examples)

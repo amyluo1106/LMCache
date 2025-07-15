@@ -72,6 +72,9 @@ class LMCLlamaModel(nn.Module):
         hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
         residual = None
 
+        # print("hidden states")
+        # print(hidden_states.shape)
+
         # TODO (Jiayi): reduce the number of calls
         attn_output = None
 

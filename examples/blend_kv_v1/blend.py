@@ -48,6 +48,8 @@ def setup_environment_variables(
         # Set the maximum size of the local CPU size to 5GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
+    os.environ["ENABLE_METRICS"] = "True"
+
 
 @contextlib.contextmanager
 def build_llm_with_lmcache(lmcache_connector: str, model: str):
@@ -65,6 +67,15 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     )
 
     llm = LLM(**asdict(llm_args))
+
+    # llm = LLM(
+    #     model=model,
+    #     kv_transfer_config=ktc,
+    #     max_model_len=8000,
+    #     gpu_memory_utilization=0.8,
+    #     enable_prefix_caching=False,
+    # )
+
     try:
         yield llm
     finally:
@@ -83,6 +94,7 @@ def print_output(
     print("-" * 50)
     for output in outputs:
         generated_text = output.outputs[0].text
+        # import pdb; pdb.set_trace()
         print(f"Generated text: {generated_text!r}")
     print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
     print("-" * 50)
@@ -111,7 +123,9 @@ def main():
     args = parse_args()
 
     lmcache_connector = "LMCacheConnectorV1"
-    model = "mistralai/Mistral-7B-Instruct-v0.2"
+    # model = "mistralai/Mistral-7B-Instruct-v0.2"
+    # model = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model = "meta-llama/Llama-3.1-8B-Instruct"
 
     setup_environment_variables(args.use_disk, args.blend_special_str)
 
@@ -124,6 +138,11 @@ def main():
         chunk1_prompt = tokenizer.encode("Hello, how are you?" * 500)[1:]
         chunk2_prompt = tokenizer.encode("Hello, what's up?" * 500)[1:]
         blend_special_str = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
+
+        # chunk1_prompt = tokenizer.encode("In the summer of 1492, Christopher Columbus, an Italian navigator, embarked on a daring voyage westward across the Atlantic Ocean. He commanded three ships: the Santa María, the Pinta, and the Niña. His primary objective was to find a westward sea route to Asia, which was known for its valuable spices and silks. However, instead of reaching Asia, he landed in the Americas, a continent previously unknown to Europeans. His first landfall was on October 12, 1492, in the Bahamas, a chain of islands in the Caribbean Sea. He named the island San Salvador, meaning 'Holy Savior.' Columbus believed he had reached the East Indies, and he referred to the native inhabitants as 'Indians'.")[1:]
+        # chunk2_prompt = tokenizer.encode("This journey marked the beginning of a new era of exploration and colonization, although it also had devastating consequences for the indigenous populations of the Americas. Over the next several decades, European powers established settlements and exploited the vast resources of the continent. The exchange of goods, ideas, and diseases between Europe and the Americas, known as the Columbian Exchange, had a profound impact on both sides of the Atlantic. New crops like potatoes and maize were introduced to Europe, while horses and cattle were brought to the Americas.")[1:]
+        # chunk3_prompt = tokenizer.encode("Columbus made three more voyages to the Americas between 1493 and 1504, exploring more of the Caribbean and the coasts of Central and South America. Despite his initial belief, he eventually came to understand that he had discovered a 'New World.' However, his legacy remains controversial, with many critics highlighting the negative impact of his expeditions on indigenous cultures and populations")[1:]
+
         first_prompt = (
             sys_prompt
             + blend_special_str
@@ -141,10 +160,37 @@ def main():
             + blend_special_str
             + chunk1_prompt
             + blend_special_str
+            # + tokenizer.encode("Hello, my name is")[1:]
             + tokenizer.encode("Hello, how are you?")[1:]
         )
 
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=10)
+        # sys_prompt = tokenizer.encode("Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n")
+
+        # second_prompt = (
+        #     sys_prompt
+        #     + blend_special_str
+        #     + chunk1_prompt
+        #     + blend_special_str
+        #     + chunk2_prompt
+        #     + blend_special_str
+        #     + chunk3_prompt
+        #     + blend_special_str
+        #     + tokenizer.encode("On which specific island did Columbus first make landfall in the Americas?")[1:]
+        # )
+
+        # first_prompt = (
+        #     sys_prompt
+        #     + blend_special_str
+        #     + chunk2_prompt
+        #     + blend_special_str
+        #     + chunk1_prompt
+        #     + blend_special_str
+        #     + chunk3_prompt
+        #     + blend_special_str
+        #     + tokenizer.encode("What does the passage suggest about the long-term consequences of Columbus's voyages, beyond the immediate discoveries?")[1:]
+        # )
+
+        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=500)
 
         # Print the first output
         print_output(llm, first_prompt, sampling_params, "first")
@@ -153,6 +199,8 @@ def main():
 
         # print the second output
         print_output(llm, second_prompt, sampling_params, "second")
+
+        # print_output(llm, first_prompt, sampling_params, "third")
 
 
 if __name__ == "__main__":
