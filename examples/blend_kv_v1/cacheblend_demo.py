@@ -62,8 +62,6 @@ def setup_environment_variables(
         # Set the maximum size of the local CPU size to 5GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
-    os.environ["ENABLE_METRICS"] = "True"
-
 
 @contextlib.contextmanager
 def build_llm_with_lmcache(lmcache_connector: str, model: str):
@@ -174,7 +172,7 @@ def create_reordered_contexts(contexts):
     
     # Create a copy and shuffle it to get a different order
     reordered_contexts = contexts.copy()
-    random.seed(42)
+    # random.seed(42)
     random.shuffle(reordered_contexts)
     
     return reordered_contexts

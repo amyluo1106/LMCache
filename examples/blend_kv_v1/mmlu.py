@@ -20,24 +20,19 @@ import logging
 # Configure the LMCache logger to only show errors or higher
 logging.getLogger("lmcache").setLevel(logging.ERROR)
 
-# Set random seeds for reproducibility
-random.seed(1)
-np.random.seed(1)
-torch.manual_seed(1)
-
 # Define special tokens for blend separation
-BLEND_SEPARATOR = "# #"
+BLEND_SEPARATOR = " # # "
 
-# os.environ["LMCACHE_CHUNK_SIZE"] = "256" # make bigger?
-# os.environ["LMCACHE_BLEND_MIN_TOKENS"] = "256"
+os.environ["LMCACHE_CHUNK_SIZE"] = "256" # make bigger?
 
-# os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
-# os.environ["LMCACHE_BLEND_SPECIAL_STR"] = BLEND_SEPARATOR
-# os.environ["LMCACHE_USE_LAYERWISE"] = "True"
+os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
+os.environ["LMCACHE_BLEND_SPECIAL_STR"] = BLEND_SEPARATOR
+os.environ["LMCACHE_USE_LAYERWISE"] = "True"
 
-# os.environ["LMCACHE_LOCAL_CPU"] = "True"
-# os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "150"
-# os.environ["ENABLE_METRICS"] = "True"
+os.environ["LMCACHE_RECOMP_RATIO"] = str(0.15)
+
+os.environ["LMCACHE_LOCAL_CPU"] = "True"
+os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
 @contextlib.contextmanager
 def build_llm_with_lmcache(model_name, lmcache_connector):
@@ -88,8 +83,8 @@ print(f"Found {len(all_subjects)} unique subjects in the MMLU dataset")
 # Select 2 subjects
 num_subjects_to_select = 2
 # selected_subjects = random.sample(all_subjects, num_subjects_to_select)
-selected_subjects = ["mmlu_pro_chat.psychology"]
-# ['mmlu_pro_chat.math', 'mmlu_pro_chat.economics', 'mmlu_pro_chat.health', 'mmlu_pro_chat.other', 'mmlu_pro_chat.computer_science', 'mmlu_pro_chat.psychology', 'mmlu_pro_chat.engineering', 'mmlu_pro_chat.business', 'mmlu_pro_chat.philosophy', 'mmlu_pro_chat.chemistry', 'mmlu_pro_chat.law', 'mmlu_pro_chat.physics', 'mmlu_pro_chat.history', 'mmlu_pro_chat.biology']
+# selected_subjects = ["mmlu_pro_chat.other"]
+selected_subjects = ['mmlu_pro_chat.math', 'mmlu_pro_chat.economics', 'mmlu_pro_chat.health', 'mmlu_pro_chat.other', 'mmlu_pro_chat.computer_science', 'mmlu_pro_chat.psychology', 'mmlu_pro_chat.engineering', 'mmlu_pro_chat.business', 'mmlu_pro_chat.philosophy', 'mmlu_pro_chat.chemistry', 'mmlu_pro_chat.law', 'mmlu_pro_chat.physics', 'mmlu_pro_chat.history', 'mmlu_pro_chat.biology']
 
 print(f"\nSelected {len(selected_subjects)} subjects for evaluation:")
 for subject in selected_subjects:
@@ -104,18 +99,18 @@ for subject in selected_subjects:
     examples_by_subject[subject] = subject_examples
     print(f"  - {subject}: {len(subject_examples)} examples")
 
-def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, show_examples=5):
+
+def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, show_examples=5, randomize_shots=True):
     """Evaluate using Llama's pre-defined prompts with blend separators and tokenized inputs."""
     
     total = min(num_examples, len(subject_examples))
-    # indices = random.sample(range(len(subject_examples)), total)
+    random.seed(42)
     indices = random.sample(range(total), total)
     
     print(f"Evaluating {total} examples from Llama's MMLU dataset...")
     
     # Lists to store data
-    prompt_texts = []  # For display purposes
-    prompt_token_ids_list = []  # For feeding to the model
+    prompt_token_ids_list = []
     correct_answers = []
     questions = []
     choices_list = []
@@ -125,7 +120,7 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
     preparation_start = time.time()
     
     # Get token IDs for the blend separator
-    blend_separator_tokens = tokenizer.encode(BLEND_SEPARATOR, add_special_tokens=False)
+    blend_separator_tokens = tokenizer.encode(BLEND_SEPARATOR)[1:]
     
     for idx in tqdm(indices, desc="Preparing prompts"):
         example = subject_examples[idx]
@@ -135,7 +130,6 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
         
         # Get the correct answer
         correct_answer = example["input_correct_responses"][0] if example["input_correct_responses"] else None
-        # answer_match = re.search(r'Answer:\s*([A-D])', correct_answer)
         answer_match = re.search(r'Answer:\s*([A-J])', correct_answer)
         if answer_match:
             correct_answer = answer_match.group(1)
@@ -145,132 +139,50 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
         if isinstance(example["input_choice_list"], dict):
             choices = example["input_choice_list"]
         
-        # Get number of shots (if available)
+        # Get number of shots
         num_shots = example["eval_config"]["num_few_shot"] if "num_few_shot" in example["eval_config"] else 0
         
-        # For display purposes
-        raw_prompt_text = ""
-        
-        # This will store our final token IDs
-        final_prompt_tokens = []
-        
+        # Get the raw prompt text
         few_shot_text = example["input_final_prompts"][0]
         
-        # Split to extract the few-shot examples without the current question
-        parts = few_shot_text.split("\n\n")
-        # intro = parts[0]  # "The following are multiple choice questions..."
-        # raw_prompt_text += intro
-        
-        # # Add intro tokens (but don't add special tokens like BOS)
-        # intro_tokens = tokenizer.encode(intro, add_special_tokens=False)
-        # final_prompt_tokens.extend(intro_tokens)
-        
-        # # Process each example separately with blend separators
-        # if len(parts) > 2:
-        #     examples_parts = parts[1:-1]  # Skip intro and last part (test question)
-            
-        #     # Process each example
-        #     for i, example_part in enumerate(examples_parts):
-        #         # Add blend separator before each example (except the first one)
-        #         if i > 0 or final_prompt_tokens:  # If not the first item or if we already have tokens
-        #             final_prompt_tokens.extend(blend_separator_tokens)
-        #             raw_prompt_text += BLEND_SEPARATOR
-                
-        #         # Add example tokens (no special tokens)
-        #         example_tokens = tokenizer.encode(example_part, add_special_tokens=False)
-        #         final_prompt_tokens.extend(example_tokens)
-        #         raw_prompt_text += example_part
+        # Split to extract parts
+        examples = few_shot_text.split("<|start_header_id|>user<|end_header_id|>")
 
-        # Initialize with BOS token if needed
-        bos_token_id = tokenizer.bos_token_id
-        if bos_token_id is not None:
-            final_prompt_tokens.append(bos_token_id)
+        for i in range(len(examples)):
+            examples[i] = "<|start_header_id|>user<|end_header_id|>" + examples[i]
 
-        # Process each part to identify examples
-        i = 0
-        while i < len(parts):
-            current_part = parts[i]
-            
-            # Check if this is the start of an example
-            if current_part.strip().startswith("Given the following question and candidate answers"):
-                # Add blend separator before the example (except for the first content we're adding)
-                if final_prompt_tokens and final_prompt_tokens != [bos_token_id] and i > 1:
-                    final_prompt_tokens.extend(blend_separator_tokens)
-                    raw_prompt_text += BLEND_SEPARATOR
-                
-                # Get the question part
-                question_part = current_part
-                
-                # Add the question tokens
-                question_tokens = tokenizer.encode(question_part, add_special_tokens=False)
-                final_prompt_tokens.extend(question_tokens)
-                # print(len(question_tokens))
-                raw_prompt_text += question_part
-                
-                # Look for instructions part (usually follows the question)
-                if i + 1 < len(parts) and "Your response should end with" in parts[i + 1]:
-                    instructions_part = parts[i + 1]
-                    instructions_tokens = tokenizer.encode(instructions_part, add_special_tokens=False)
-                    final_prompt_tokens.extend(instructions_tokens)
-                    # print(len(final_prompt_tokens))
-                    raw_prompt_text += instructions_part
-                    i += 1  # Skip this part in the next iteration
-                
-                # Look for the "Let's think step by step" prompt
-                if i + 1 < len(parts) and "Let's think step by step" in parts[i + 1]:
-                    thinking_part = parts[i + 1].split("<|eot_id|>")[0]  # Get just the thinking part
-                    # thinking_part = parts[i + 1]
-                    thinking_tokens = tokenizer.encode(thinking_part, add_special_tokens=False)
-                    final_prompt_tokens.extend(thinking_tokens)
-                    # print(len(thinking_tokens))
-                    raw_prompt_text += thinking_part
-                    i += 1  # Skip this part in the next iteration
-                
-                # Look for the answer part (usually follows after some separators)
-                answer_index = i + 1
-                while answer_index < len(parts):
-                    if parts[answer_index].strip().startswith("We refer to Wikipedia articles"):
-                        answer_part = parts[answer_index].split("<|eot_id|>")[0]  # Get just the answer part
-                        # answer_part = parts[answer_index]
-                        answer_tokens = tokenizer.encode(answer_part, add_special_tokens=False)
-                        final_prompt_tokens.extend(answer_tokens)
-                        # print(len(answer_tokens))
-                        raw_prompt_text += answer_part
-                        break
-                    answer_index += 1
-            else:
-                # For other content (like intro), just add it without separators
-                if not raw_prompt_text:  # Only add if this is the first content
-                    part_tokens = tokenizer.encode(current_part, add_special_tokens=False)
-                    final_prompt_tokens.extend(part_tokens)
-                    # print(len(part_tokens))
-                    raw_prompt_text += current_part
-            
-            i += 1
-        print()
+        examples.pop(0)
+
+        raw_prompt_text = ""
         
-        # # Format the test question with choices
-        # question_text = f"Question: {input_question}\n\nChoices:\n"
-        # for choice_key in sorted(choices.keys()):
-        #     question_text += f"{choice_key}. {choices[choice_key]}\n"
-        # question_text += "Provide the letter corresponding to the correct answer."
+        # The last example in our list should be the final test question
+        if examples and int(num_shots) > 0:
+            # Take the last example as our final test question
+            final_test_question = examples.pop()  # Remove and store the last example
         
-        # # Add blend separator before the test question
-        # if final_prompt_tokens:
-        #     final_prompt_tokens.extend(blend_separator_tokens)
-        #     raw_prompt_text += BLEND_SEPARATOR
+        # Now we can shuffle just the examples (not the final test question)
+        if randomize_shots and examples:
+            # random.seed(42)
+            random.shuffle(examples)
+
+        context_chunks = []
+        for idx, ctx in enumerate(examples):
+            ctx_tokens = tokenizer.encode(ctx)[1:]
+            context_chunks.append(ctx_tokens)
+
+        final_prompt_tokens = tokenizer.encode("Choose the best multiple choice answer.\n")
+        # print("context chunk lengths")
+        # print(len(final_prompt_tokens))
+
+        for ctx_chunk in context_chunks:
+            final_prompt_tokens = final_prompt_tokens + blend_separator_tokens + ctx_chunk
+            # print(len(ctx_chunk))
+
+        question_tokens = tokenizer.encode(final_test_question)[1:]
+        final_prompt_tokens = final_prompt_tokens + blend_separator_tokens + question_tokens
+        # print(len(question_tokens))
         
-        # # Add test question tokens (no special tokens)
-        # test_question_tokens = tokenizer.encode(question_text, add_special_tokens=False)
-        # final_prompt_tokens.extend(test_question_tokens)
-        # raw_prompt_text += question_text
-        
-        # # Add BOS token at the beginning if needed
-        # bos_token_id = tokenizer.bos_token_id
-        # if bos_token_id is not None:
-        #     final_prompt_tokens = [bos_token_id] + final_prompt_to        prompt_texts.append(raw_prompt_text)  # Keep text for display
-        # print(prompt_texts)
-        prompt_token_ids_list.append(final_prompt_tokens)  # Store token IDs for model input
+        prompt_token_ids_list.append((final_prompt_tokens))
         correct_answers.append(correct_answer.strip('"'))
         questions.append(input_question)
         choices_list.append(choices)
@@ -288,7 +200,7 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
 
     
     # Set sampling parameters
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=500) #top_k?
+    sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=2000) #top_k?
     
     # Generate outputs using token IDs directly
     print("Generating answers...")
@@ -301,6 +213,7 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
     for p in prompt_token_ids_list:
         out = llm.generate(prompt_token_ids=p, sampling_params=sampling_params)
         outputs.append(out[0].outputs[0].text)
+        time.sleep(1)
     
     # End generation timing
     generation_end = time.time()
@@ -308,11 +221,6 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
     
     print(f"LLM generation time: {generation_time:.2f} seconds ({generation_time/total:.4f} sec/example)")
     print(f"Generation throughput: {total_tokens/generation_time:.1f} tokens/sec")
-    
-    # Calculate total generated tokens
-    # total_output_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
-    # print(f"Total output tokens: {total_output_tokens}")
-    # print(f"Output generation throughput: {total_output_tokens/generation_time:.1f} tokens/sec")
     
     # Start parsing timing
     parsing_start = time.time()
@@ -326,32 +234,21 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
         parsed_letter = None
         
         # Try different parsing approaches
-        # 1. Look for "Answer: X" pattern
-        # answer_match = re.search(r'Answer:\s*([A-D])', response)
-        # if answer_match:
-        #     parsed_letter = answer_match.group(1)
-        
-        # # 2. Look for standalone A, B, C, or D
-        # elif re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response):
-        #     letter_match = re.search(r'(?:^|\s|\n|[.,;:])([A-D])(?:$|\s|\n|[.,;:])', response)
-        #     parsed_letter = letter_match.group(1)
-        
-        # # 3. Just take the first letter that is A, B, C, or D in the response
-        # else:
-        #     for char in response:
-        #         if char in "ABCD":
-        #             parsed_letter = char
-        #             break
         answer_match = re.search(r'Answer:\s*([A-J])', response)
         if answer_match:
             parsed_letter = answer_match.group(1)
         
-        # 2. Look for standalone A, B, C, or D
+        # Look for "The best answer is X" pattern
+        elif re.search(r'best answer is ([A-J])', response, re.IGNORECASE):
+            best_match = re.search(r'best answer is ([A-J])', response, re.IGNORECASE)
+            parsed_letter = best_match.group(1)
+        
+        # Look for standalone A-J
         elif re.search(r'(?:^|\s|\n|[.,;:])([A-J])(?:$|\s|\n|[.,;:])', response):
             letter_match = re.search(r'(?:^|\s|\n|[.,;:])([A-J])(?:$|\s|\n|[.,;:])', response)
             parsed_letter = letter_match.group(1)
         
-        # 3. Just take the first letter that is A, B, C, or D in the response
+        # Just take the first letter that is A-J in the response
         else:
             for char in response:
                 if char in "ABCDEFGHIJ":
@@ -397,13 +294,10 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
         "total_time": total_time,
         "tokens_per_prompt": avg_tokens,
         "total_tokens": total_tokens,
-        # "total_output_tokens": total_output_tokens,
         "generation_throughput": total_tokens/generation_time if generation_time > 0 else 0,
-        # "output_throughput": total_output_tokens/generation_time if generation_time > 0 else 0
     }
     
     return accuracy, timing_stats
-
 
 # Use the LMCache-enabled LLM for evaluation
 with build_llm_with_lmcache(model_name, lmcache_connector) as llm:
