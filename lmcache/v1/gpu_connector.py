@@ -91,205 +91,10 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """Get the shape of the data given the number of tokens."""
         raise NotImplementedError
 
-
-class VLLMNestedTupleGPUConnector(GPUConnectorInterface):
-    """
-    The GPU KV cache should be a nested tuple of K and V tensors.
-    More specifically, we have:
-    - GPUTensor = Tuple[KVLayer, ...]
-    - KVLayer = Tuple[Tensor, Tensor]
-    - Tensor: [num_tokens, ...]
-
-    The token dimension is specified by `token_dim` when constructing the
-    connector.
-
-    It will produce / consume memory object with KV_2LTD format
-    """
-
-    def __init__(self, hidden_dim_size: int, num_layers: int):
-        """
-        :param int gpu_token_dim: The token dimension of the GPU KV cache in
-            the nested tuple.
-        """
-        self.hidden_dim_size = hidden_dim_size
-        self.num_layers = num_layers
-
-    # TODO(Jiayi): fix the gpu memory
-    @_lmcache_nvtx_annotate
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-        :raises AssertionError: If the memory object does not have a tensor.
-        """
-        assert memory_obj.tensor is not None
-
-        if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-            raise ValueError(
-                "The memory object should be in KV_2LTD format in"
-                " order to be processed by NestedTupleGPUConnector"
-            )
-
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
-        kvcaches: Tuple[Tuple[torch.Tensor, ...], ...] = kwargs["kvcaches"]
-
-        for layer_id, layer in enumerate(kvcaches):
-            k, v = layer
-            hidden_shape = k.shape[1:]
-            k[start:end].copy_(
-                memory_obj.tensor[0, layer_id].reshape(-1, *hidden_shape),
-                non_blocking=False,
-            )
-            v[start:end].copy_(
-                memory_obj.tensor[1, layer_id].reshape(-1, *hidden_shape),
-                non_blocking=False,
-            )
-
-    @_lmcache_nvtx_annotate
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs, or the
-            memory object is not in KV_2LTD format.
-        :raises AssertionError: If the memory object does not have a tensor.
-        """
-        assert memory_obj.tensor is not None
-
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
-        kvcaches: Tuple[Tuple[torch.Tensor, ...], ...] = kwargs["kvcaches"]
-
-        put_stream = torch.cuda.Stream()
-        # Wait for all operations on the default stream to finish
-        put_stream.wait_stream(torch.cuda.default_stream(kvcaches[0][0].device))
-
-        for layer_id, layer in enumerate(kvcaches):
-            k, v = layer
-            k.record_stream(put_stream)
-            v.record_stream(put_stream)
-
-        with torch.cuda.stream(put_stream):
-            for layer_id, layer in enumerate(kvcaches):
-                k, v = layer
-                memory_obj.tensor[1, layer_id].copy_(
-                    v[start:end].reshape(-1, self.hidden_dim_size).contiguous(),
-                    non_blocking=True,
-                )
-                memory_obj.tensor[0, layer_id].copy_(
-                    k[start:end].reshape(-1, self.hidden_dim_size).contiguous(),
-                    non_blocking=True,
-                )
-        put_stream.synchronize()
-
-    # TODO(Jiayi): need to optimize
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
-
-    def get_shape(self, num_tokens: int) -> torch.Size:
-        return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
-
-
-class VLLMPagedMemGPUConnector(GPUConnectorInterface):
-    """
-    The GPU KV cache should be a nested tuple of K and V tensors.
-    More specifically, we have:
-    - GPUTensor = Tuple[KVLayer, ...]
-    - KVLayer = Tuple[Tensor, Tensor]
-    - Tensor: [num_blocks, block_size, num_heads, head_size]
-
-    It will produce / consume memory object with KV_2LTD format
-    """
-
-    def __init__(self, hidden_dim_size: int, num_layers: int):
-        """
-        :param int gpu_token_dim: The token dimension of the GPU KV cache in
-            the nested tuple.
-        """
-        self.hidden_dim_size = hidden_dim_size
-        self.num_layers = num_layers
-
-    @_lmcache_nvtx_annotate
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
-        """
-        assert memory_obj.tensor is not None
-
-        if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-            raise ValueError(
-                "The memory object should be in KV_2LTD format in"
-                " order to be processed by VLLMPagedMemGPUConnector"
-            )
-
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        kvcaches: Tuple[Tuple[torch.Tensor, ...], ...] = kwargs["kvcaches"]
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
-        for layer_id, layer in enumerate(kvcaches):
-            k, v = layer[0], layer[1]
-            lmc_ops.reshape_and_cache_back_flash(
-                memory_obj.tensor, k, v, slot_mapping[start:end], layer_id
-            )
-
-        # TODO(Jiayi): Currently, this is a blocking operation.
-        # We might be able to continue other decode jobs while
-        # waiting for the copy to finish.
-
-    @_lmcache_nvtx_annotate
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs, or the
-            memory object is not in KV_2LTD format.
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
-        """
-        assert memory_obj.tensor is not None
-
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        if "offset" in kwargs:
-            start = start - kwargs["offset"]
-            end = end - kwargs["offset"]
-        assert start >= 0 and end >= start
-
-        kvcaches: Tuple[Tuple[torch.Tensor, ...], ...] = kwargs["kvcaches"]
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        for layer_id, layer in enumerate(kvcaches):
-            k, v = layer[0], layer[1]
-            lmc_ops.load_and_reshape_flash(
-                memory_obj.tensor, k, v, slot_mapping[start:end], layer_id
-            )
-
-        torch.cuda.synchronize()
-
-    # TODO(Jiayi): need to optimize
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
-
-    def get_shape(self, num_tokens: int) -> torch.Size:
-        return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
+    def initialize_kvcaches_ptr(self, **kwargs):
+        """Initialize the kvcaches pointers if not already initialized."""
+        if "kvcaches" in kwargs:
+            self.kvcaches = kwargs["kvcaches"]
 
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
@@ -326,6 +131,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
         self.page_buffer_size = 0
 
+        self.kvcaches: Optional[List[torch.Tensor]] = None
+
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
         if use_gpu:
@@ -340,6 +147,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             self.gpu_buffer = torch.empty(
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
+
+        self.store_stream = torch.cuda.Stream()
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
         self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
@@ -382,6 +191,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         """
         assert memory_obj.tensor is not None
 
+        self.initialize_kvcaches_ptr(**kwargs)
+
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
         if self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
@@ -395,22 +210,18 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     " order to be processed by VLLMPagedMemGPUConnector"
                 )
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
             slot_mapping[start:end],
-            kvcaches[0].device,
+            self.kvcaches[0].device,
             self.page_buffer_size,
             False,
             self.use_mla,
@@ -437,50 +248,57 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         """
         assert memory_obj.tensor is not None
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-            lmc_ops.multi_layer_kv_transfer(
-                memory_obj.tensor,
-                kv_cache_pointers,
-                slot_mapping[start:end],
-                kvcaches[0].device,
-                self.page_buffer_size,
-                True,
-                self.use_mla,
-            )
-        else:
-            # kvcaches -> gpu_buffer -> memobj
-            assert self.gpu_buffer.device == kvcaches[0].device
-            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-            lmc_ops.multi_layer_kv_transfer(
-                tmp_gpu_buffer,
-                kv_cache_pointers,
-                slot_mapping[start:end],
-                kvcaches[0].device,
-                self.page_buffer_size,
-                True,
-                self.use_mla,
-            )
-            memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+        with torch.cuda.stream(self.store_stream):
+            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                lmc_ops.multi_layer_kv_transfer(
+                    memory_obj.tensor,
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    self.kvcaches[0].device,
+                    self.page_buffer_size,
+                    True,
+                    self.use_mla,
+                )
+            else:
+                # kvcaches -> gpu_buffer -> memobj
+                assert self.gpu_buffer.device == self.kvcaches[0].device
+                tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                lmc_ops.multi_layer_kv_transfer(
+                    tmp_gpu_buffer,
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    self.kvcaches[0].device,
+                    self.page_buffer_size,
+                    True,
+                    self.use_mla,
+                )
+                memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
         if not memory_obj.tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            torch.cuda.synchronize()
+            self.store_stream.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
+    # TODO(Jiayi): need to optimize to enable real batching
+    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.to_gpu(memory_obj, start, end, **kwargs)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -493,67 +311,54 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
 
 class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
-    """ """
-
     def __init__(
         self,
         hidden_dim_size: int,
         num_layers: int,
         use_gpu: bool = False,
+        use_double_buffer: bool = True,
         **kwargs,
     ):
-        """ """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
+
+        self.kvcaches: Optional[List[torch.Tensor]] = None
 
         # TODO(Jiayi): remove this hardcode
         self.cache_positions = True
 
         self.fused_rotary_emb = None
 
-        if use_gpu:
-            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
-            assert "device" in kwargs, (
-                "device should be provided to create a GPU buffer."
-            )
+        assert use_gpu, "use_gpu must be true in VLLMBufferLayerwiseGPUConnector"
+        assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
+        assert "device" in kwargs, "device should be provided to create a GPU buffer."
 
-            max_tokens = kwargs.get("max_tokens", 32000)
-            logger.info(
-                f"Using max_tokens={max_tokens} for VLLMBufferLayerwiseGPUConnector"
-            )
-            shape = self.get_shape(max_tokens)
-            self.dtype = kwargs["dtype"]
-            self.device = kwargs["device"]
+        max_tokens = kwargs.get("max_tokens", 32000)
+        logger.info(
+            f"Using max_tokens={max_tokens} for VLLMBufferLayerwiseGPUConnector"
+        )
+        shape = self.get_shape(max_tokens)
+        self.dtype = kwargs["dtype"]
+        self.device = kwargs["device"]
 
-            num_elements = shape.numel()
+        num_elements = shape.numel()
 
-            # All sizes are in bytes
-            element_size = torch.tensor([], dtype=self.dtype).element_size()
-            # We need to `2 *` here because we need two buffers:
-            # one for storing/loading and the other for compute
-            gpu_buffer_size = 2 * num_elements * element_size
-            self.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
-            )
+        # All sizes are in bytes
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        # We need to `2 *` here because we need two buffers:
+        # one for storing/loading and the other for compute
+        gpu_buffer_size = 2 * num_elements * element_size
+        self.gpu_buffer_allocator = GPUMemoryAllocator(
+            gpu_buffer_size, device=self.device
+        )
 
-            self.load_stream = torch.cuda.Stream()
-            self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
 
-            self.buffer_mapping = {}
+        self.buffer_mapping = {}
 
-        else:
-            # TODO(Jiayi): Support `use_gpu=False` case
-            pass
-
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """ """
-
-        raise NotImplementedError
-
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """ """
-
-        raise NotImplementedError
+        # track gap positions between blended chunks
+        self.current_gap_positions = None
 
     def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -565,6 +370,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         gpu_buffer = self.buffer_mapping[layer_id].tensor
         return gpu_buffer[0], gpu_buffer[1]
+
+    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """ """
+
+        raise NotImplementedError
+
+    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """ """
+
+        raise NotImplementedError
 
     @_lmcache_nvtx_annotate
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
@@ -583,8 +398,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -594,16 +411,26 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
             self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         num_all_tokens = ends[-1] - starts[0]
         slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
 
+        # compute gap positions
+        gap_mask = torch.ones(
+            num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
+        )
+        buf_offset = starts[0]
+
+        for start, end in zip(starts, ends, strict=False):
+            gap_mask[start - buf_offset : end - buf_offset] = False
+
+        self.current_gap_positions = torch.where(gap_mask)[0]
+
         buf_offset = starts[0]
         if self.cache_positions:
             new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=kvcaches[0].device
+                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
             )
 
         buffer_shape = self.get_shape(num_all_tokens)
@@ -613,11 +440,6 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, MemoryFormat.KV_2TD
         )
-
-        # add some logic to reset blend separator token positions in gpu buffer tensor to be 0
-        for i in range(len(ends) - 1):
-            load_gpu_buffer_obj.tensor[:, ends[i] - buf_offset : starts[i+1] - buf_offset] = 0
-
         assert compute_gpu_buffer_obj is not None, (
             "Failed to allocate GPU buffer in GPUConnector"
         )
@@ -631,14 +453,14 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         if self.cache_positions:
             old_positions_full = torch.zeros(
-                (num_all_tokens,), dtype=torch.int64, device=kvcaches[0].device
+                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
             )
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
-                    kvcaches[layer_id - 2][0],
-                    kvcaches[layer_id - 2][1],
+                    self.kvcaches[layer_id - 2][0],
+                    self.kvcaches[layer_id - 2][1],
                     slot_mapping_full,
                     False,
                     False,  # shape is [2, num_tokens, hidden_dim]
@@ -665,6 +487,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         new_positions_full,
                         compute_gpu_buffer_obj.tensor[0],
                     )
+
+                # gap zeroing after RoPE
+                if self.current_gap_positions.numel():
+                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
@@ -743,13 +569,14 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         buf_start = 0
@@ -764,7 +591,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             if self.cache_positions:
                 old_positions_chunks.append(
                     torch.arange(
-                        start, end, device=kvcaches[0].device, dtype=torch.int64
+                        start, end, device=self.kvcaches[0].device, dtype=torch.int64
                     )
                 )
 
@@ -789,8 +616,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 self.store_stream.wait_stream(current_stream)
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
-                    kvcaches[layer_id][0],
-                    kvcaches[layer_id][1],
+                    self.kvcaches[layer_id][0],
+                    self.kvcaches[layer_id][1],
                     slot_mapping_full,
                     True,
                     False,  # shape is [2, num_tokens, hidden_dim]
@@ -835,45 +662,28 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
-        """ """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.use_gpu = use_gpu
 
         self.gpu_buffer_allocator = None
-        if use_gpu:
-            assert "chunk_size" in kwargs, (
-                "chunk_size should be provided to create a GPU buffer."
-            )
-            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
-            assert "device" in kwargs, (
-                "device should be provided to create a GPU buffer."
-            )
 
-            self.max_tokens = kwargs.get("max_tokens", 32000)
-            logger.info(
-                f"Max_tokens={self.max_tokens} is set for "
-                "VLLMPagedMemLayerwiseGPUConnector. However, this will not be used if "
-                "the number is smaller than the max number of tokens vllm can hold."
-            )
-            # shape = self.get_shape(max_tokens)
-            self.dtype = kwargs["dtype"]
-            self.device = kwargs["device"]
+        assert "chunk_size" in kwargs, (
+            "chunk_size should be provided to create a GPU buffer."
+        )
+        assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
+        assert "device" in kwargs, "device should be provided to create a GPU buffer."
 
-            # num_elements = shape.numel()
+        self.dtype = kwargs["dtype"]
+        self.device = kwargs["device"]
 
-            # All sizes are in bytes
-            self.element_size = torch.tensor([], dtype=self.dtype).element_size()
-            # gpu_buffer_size = num_elements * element_size
-            # self.gpu_buffer_allocator = GPUMemoryAllocator(
-            #     gpu_buffer_size, device=self.device
-            # )
+        self.kvcaches: Optional[List[torch.Tensor]] = None
 
-            self.load_stream = torch.cuda.Stream()
-            self.store_stream = torch.cuda.Stream()
-        else:
-            # TODO(Jiayi): Support `use_gpu=False` case
-            pass
+        # All sizes are in bytes
+        self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -925,13 +735,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -939,11 +749,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if "sync" not in kwargs:
             raise ValueError("'sync' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(kvcaches)
+        self._lazy_initialize_buffer(self.kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -953,14 +762,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
-        buffer_shape = self.get_shape(num_tokens)
-        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_T2D
-        )
-        assert tmp_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert tmp_gpu_buffer_obj.tensor is not None
+
+        if self.use_gpu:
+            buffer_shape = self.get_shape(num_tokens)
+            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+            )
+            assert tmp_gpu_buffer_obj is not None, (
+                "Failed to allocate GPU buffer in GPUConnector"
+            )
+            assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
@@ -978,18 +789,29 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
-                    tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
-                        memory_obj.tensor, non_blocking=True
-                    )
+                    if self.use_gpu:
+                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
+                            memory_obj.tensor, non_blocking=True
+                        )
+                    else:
+                        lmc_ops.single_layer_kv_transfer(
+                            memory_obj.tensor,
+                            self.kvcaches[layer_id][0],
+                            self.kvcaches[layer_id][1],
+                            slot_mapping_full,
+                            False,
+                            True,
+                        )
 
-                lmc_ops.single_layer_kv_transfer(
-                    tmp_gpu_buffer_obj.tensor,
-                    kvcaches[layer_id][0],
-                    kvcaches[layer_id][1],
-                    slot_mapping_full,
-                    False,
-                    True,
-                )
+                if self.use_gpu:
+                    lmc_ops.single_layer_kv_transfer(
+                        tmp_gpu_buffer_obj.tensor,
+                        self.kvcaches[layer_id][0],
+                        self.kvcaches[layer_id][1],
+                        slot_mapping_full,
+                        False,
+                        True,
+                    )
         yield
 
         # synchronize the last layer
@@ -1031,13 +853,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -1045,11 +867,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if "sync" not in kwargs:
             raise ValueError("'sync' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(kvcaches)
+        self._lazy_initialize_buffer(self.kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1058,14 +879,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
-        buffer_shape = self.get_shape(num_tokens)
-        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_T2D
-        )
-        assert tmp_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert tmp_gpu_buffer_obj.tensor is not None
+
+        if self.use_gpu:
+            buffer_shape = self.get_shape(num_tokens)
+            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+            )
+            assert tmp_gpu_buffer_obj is not None, (
+                "Failed to allocate GPU buffer in GPUConnector"
+            )
+            assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
@@ -1075,22 +898,33 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
-                lmc_ops.single_layer_kv_transfer(
-                    tmp_gpu_buffer_obj.tensor,
-                    kvcaches[layer_id][0],
-                    kvcaches[layer_id][1],
-                    slot_mapping_full,
-                    True,
-                    True,
-                )
+                if self.use_gpu:
+                    lmc_ops.single_layer_kv_transfer(
+                        tmp_gpu_buffer_obj.tensor,
+                        self.kvcaches[layer_id][0],
+                        self.kvcaches[layer_id][1],
+                        slot_mapping_full,
+                        True,
+                        True,
+                    )
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.tensor is not None
-                    memory_obj.tensor.copy_(
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
-                        non_blocking=True,
-                    )
+                    if self.use_gpu:
+                        memory_obj.tensor.copy_(
+                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
+                            non_blocking=True,
+                        )
+                    else:
+                        lmc_ops.single_layer_kv_transfer(
+                            memory_obj.tensor,
+                            self.kvcaches[layer_id][0],
+                            self.kvcaches[layer_id][1],
+                            slot_mapping[start:end],
+                            True,
+                            True,
+                        )
 
             yield
             if sync:
@@ -1125,14 +959,18 @@ class SGLangGPUConnector(GPUConnectorInterface):
     ):
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
-        self.key_pointers = torch.empty(num_layers, dtype=torch.int64, device="cpu")
-        self.value_pointers = torch.empty(num_layers, dtype=torch.int64, device="cpu")
 
-        self.key_pointers_on_gpu: dict[int, torch.Tensor] = {}
-        self.value_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
         self.page_buffer_size = 0
 
         self.gpu_buffer: Optional[torch.Tensor] = None
+        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+
+        self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
+        self.kv_cache_pointers = torch.empty(
+            self.num_kv_cache, dtype=torch.int64, device="cpu"
+        )
+
         if use_gpu:
             assert "chunk_size" in kwargs, (
                 "chunk_size should be provided to create a GPU buffer."
@@ -1147,25 +985,22 @@ class SGLangGPUConnector(GPUConnectorInterface):
             logger.info(f"GPU buffer: {self.gpu_buffer.shape}")
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
-        k, v = kv_caches
-        self.key_pointers.numpy()[:] = [t.data_ptr() for t in k]
-        self.value_pointers.numpy()[:] = [t.data_ptr() for t in v]
-        device = k[0].device
+        assert len(kv_caches) == self.num_kv_cache
+
+        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
+        device = kv_caches[0].device
         assert device.type == "cuda", "The device should be CUDA."
         idx = device.index
-        if idx not in self.key_pointers_on_gpu:
-            self.key_pointers_on_gpu[idx] = torch.empty(
-                self.num_layers, dtype=torch.int64, device=device
+        if idx not in self.kv_cache_pointers_on_gpu:
+            self.kv_cache_pointers_on_gpu[idx] = torch.empty(
+                self.num_kv_cache, dtype=torch.int64, device=device
             )
-        if idx not in self.value_pointers_on_gpu:
-            self.value_pointers_on_gpu[idx] = torch.empty(
-                self.num_layers, dtype=torch.int64, device=device
-            )
-        self.key_pointers_on_gpu[idx].copy_(self.key_pointers)
-        self.value_pointers_on_gpu[idx].copy_(self.value_pointers)
+        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
 
-        self.page_buffer_size = k[0].shape[0]
-        return self.key_pointers_on_gpu[idx], self.value_pointers_on_gpu[idx]
+        # sglang MLA kv_caches[0].shape: [num_pages * page_size, 1, head_size]
+        # sglang MHA kv_caches[0].shape: [num_pages * page_size, num_heads, head_size]
+        self.page_buffer_size = kv_caches[0].shape[0]
+        return self.kv_cache_pointers_on_gpu[idx]
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1187,11 +1022,18 @@ class SGLangGPUConnector(GPUConnectorInterface):
         """
         assert memory_obj.tensor is not None
 
-        if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-            raise ValueError(
-                "The memory object should be in KV_2LTD format in"
-                " order to be processed by VLLMPagedMemGPUConnector"
-            )
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    f" order to be processed by {self.__class__.__name__}"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    f" order to be processed by {self.__class__.__name__}"
+                )
 
         if "kvcaches" not in kwargs:
             raise ValueError("'kvcaches' should be provided in kwargs.")
@@ -1204,15 +1046,15 @@ class SGLangGPUConnector(GPUConnectorInterface):
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        key_pointers, value_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_pointers = self._initialize_pointers(kvcaches)
         lmc_ops.multi_layer_kv_transfer_unilateral(
             memory_obj.tensor,
-            key_pointers,
-            value_pointers,
+            kv_cache_pointers,
             slot_mapping[start - offset : end - offset],
             kvcaches[0][0].device,
             self.page_buffer_size,
             False,
+            self.use_mla,
         )
 
     @_lmcache_nvtx_annotate
@@ -1245,17 +1087,17 @@ class SGLangGPUConnector(GPUConnectorInterface):
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        key_pointers, value_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_pointers = self._initialize_pointers(kvcaches)
 
         if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
             lmc_ops.multi_layer_kv_transfer_unilateral(
                 memory_obj.tensor,
-                key_pointers,
-                value_pointers,
+                kv_cache_pointers,
                 slot_mapping[start:end],
                 kvcaches[0][0].device,
                 self.page_buffer_size,
                 True,
+                self.use_mla,
             )
         else:
             # kvcaches -> gpu_buffer -> memobj
@@ -1263,12 +1105,12 @@ class SGLangGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
             lmc_ops.multi_layer_kv_transfer_unilateral(
                 tmp_gpu_buffer,
-                key_pointers,
-                value_pointers,
+                kv_cache_pointers,
                 slot_mapping[start:end],
                 kvcaches[0][0].device,
                 self.page_buffer_size,
                 True,
+                self.use_mla,
             )
             memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
@@ -1278,8 +1120,16 @@ class SGLangGPUConnector(GPUConnectorInterface):
             # memory object
             torch.cuda.synchronize()
 
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    # TODO(Jiayi): need to optimize to enable real batching
+    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.to_gpu(memory_obj, start, end, **kwargs)
 
     # TODO(Yuwei): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
