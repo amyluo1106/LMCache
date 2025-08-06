@@ -1,8 +1,6 @@
-import numpy as np
 import random
 from datasets import load_dataset
 from tqdm import tqdm
-import torch
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from transformers import AutoTokenizer
@@ -23,16 +21,16 @@ logging.getLogger("lmcache").setLevel(logging.ERROR)
 # Define special tokens for blend separation
 BLEND_SEPARATOR = " # # "
 
-os.environ["LMCACHE_CHUNK_SIZE"] = "256" # make bigger?
+os.environ["LMCACHE_CHUNK_SIZE"] = "256"
 
 os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
 os.environ["LMCACHE_BLEND_SPECIAL_STR"] = BLEND_SEPARATOR
 os.environ["LMCACHE_USE_LAYERWISE"] = "True"
 
-os.environ["LMCACHE_RECOMP_RATIO"] = str(0.15)
+os.environ["LMCACHE_BLEND_RECOMPUTE_RATIO"] = str(0.15) 
 
 os.environ["LMCACHE_LOCAL_CPU"] = "True"
-os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
+os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "40"
 
 @contextlib.contextmanager
 def build_llm_with_lmcache(model_name, lmcache_connector):
@@ -50,10 +48,10 @@ def build_llm_with_lmcache(model_name, lmcache_connector):
         model=model_name,
         kv_transfer_config=ktc,  
         max_model_len=8000,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=0.9,
         enable_prefix_caching=False,
         enforce_eager=True,  # disable torch compile
-        # tensor_parallel_size=4  # adjust based on available GPUs
+        tensor_parallel_size=4  # adjust based on available GPUs
     )
 
     try:
@@ -80,11 +78,8 @@ llama_mmlu_data = load_dataset(
 all_subjects = list(set(llama_mmlu_data["subtask_name"]))
 print(f"Found {len(all_subjects)} unique subjects in the MMLU dataset")
 
-# Select 2 subjects
-num_subjects_to_select = 2
-# selected_subjects = random.sample(all_subjects, num_subjects_to_select)
-# selected_subjects = ["mmlu_pro_chat.other"]
-selected_subjects = ['mmlu_pro_chat.math', 'mmlu_pro_chat.economics', 'mmlu_pro_chat.health', 'mmlu_pro_chat.other', 'mmlu_pro_chat.computer_science', 'mmlu_pro_chat.psychology', 'mmlu_pro_chat.engineering', 'mmlu_pro_chat.business', 'mmlu_pro_chat.philosophy', 'mmlu_pro_chat.chemistry', 'mmlu_pro_chat.law', 'mmlu_pro_chat.physics', 'mmlu_pro_chat.history', 'mmlu_pro_chat.biology']
+selected_subjects = ["mmlu_pro_chat.economics"]
+# selected_subjects = ['mmlu_pro_chat.math', 'mmlu_pro_chat.economics', 'mmlu_pro_chat.health', 'mmlu_pro_chat.other', 'mmlu_pro_chat.computer_science', 'mmlu_pro_chat.psychology', 'mmlu_pro_chat.engineering', 'mmlu_pro_chat.business', 'mmlu_pro_chat.philosophy', 'mmlu_pro_chat.chemistry', 'mmlu_pro_chat.law', 'mmlu_pro_chat.physics', 'mmlu_pro_chat.history', 'mmlu_pro_chat.biology']
 
 print(f"\nSelected {len(selected_subjects)} subjects for evaluation:")
 for subject in selected_subjects:
@@ -100,7 +95,7 @@ for subject in selected_subjects:
     print(f"  - {subject}: {len(subject_examples)} examples")
 
 
-def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, show_examples=5, randomize_shots=True):
+def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=15, show_examples=5, randomize_shots=True):
     """Evaluate using Llama's pre-defined prompts with blend separators and tokenized inputs."""
     
     total = min(num_examples, len(subject_examples))
@@ -152,8 +147,6 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
             examples[i] = "<|start_header_id|>user<|end_header_id|>" + examples[i]
 
         examples.pop(0)
-
-        raw_prompt_text = ""
         
         # The last example in our list should be the final test question
         if examples and int(num_shots) > 0:
@@ -171,16 +164,12 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
             context_chunks.append(ctx_tokens)
 
         final_prompt_tokens = tokenizer.encode("Choose the best multiple choice answer.\n")
-        # print("context chunk lengths")
-        # print(len(final_prompt_tokens))
 
         for ctx_chunk in context_chunks:
-            final_prompt_tokens = final_prompt_tokens + blend_separator_tokens + ctx_chunk
-            # print(len(ctx_chunk))
+            final_prompt_tokens = final_prompt_tokens + blend_separator_tokens + ctx_chun
 
         question_tokens = tokenizer.encode(final_test_question)[1:]
         final_prompt_tokens = final_prompt_tokens + blend_separator_tokens + question_tokens
-        # print(len(question_tokens))
         
         prompt_token_ids_list.append((final_prompt_tokens))
         correct_answers.append(correct_answer.strip('"'))
@@ -198,11 +187,8 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
     avg_tokens = total_tokens / len(prompt_token_ids_list) if prompt_token_ids_list else 0
     print(f"Total tokens across all prompts: {total_tokens}")
 
+    sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=2000) 
     
-    # Set sampling parameters
-    sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=2000) #top_k?
-    
-    # Generate outputs using token IDs directly
     print("Generating answers...")
     
     # Start generation timing
@@ -222,7 +208,6 @@ def evaluate_llama_examples(llm, tokenizer, subject_examples, num_examples=5, sh
     print(f"LLM generation time: {generation_time:.2f} seconds ({generation_time/total:.4f} sec/example)")
     print(f"Generation throughput: {total_tokens/generation_time:.1f} tokens/sec")
     
-    # Start parsing timing
     parsing_start = time.time()
     
     # Calculate accuracy
@@ -331,7 +316,6 @@ with build_llm_with_lmcache(model_name, lmcache_connector) as llm:
         print(f"  - Response Parsing: {timing['parsing_time']:.2f}s")
         print(f"  - Total Time: {timing['total_time']:.2f}s")
         print(f"  - Generation throughput: {timing['generation_throughput']:.1f} tokens/sec")
-        # print(f"  - Output throughput: {timing['output_throughput']:.1f} tokens/sec")
 
 # Additional information about the dataset
 print("\n" + "="*70)

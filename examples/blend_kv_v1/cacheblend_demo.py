@@ -4,8 +4,6 @@ import argparse
 import contextlib
 import os
 import time
-import json
-import numpy as np
 import logging
 
 # Third Party
@@ -17,10 +15,9 @@ from vllm.engine.arg_utils import EngineArgs
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
-from lmcache.utils import CacheEngineKey
 
 # Local imports
-from utils import load_dataset, normalize_question, build_qa_prompt, compute_f1
+from utils import load_dataset, normalize_question, compute_f1
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, 
@@ -40,7 +37,7 @@ def setup_environment_variables(
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
     
     # Set recomputation ratio
-    os.environ["LMCACHE_RECOMP_RATIO"] = str(recomp_ratio)
+    os.environ["LMCACHE_BLEND_RECOMPUTE_RATIO"] = "0.15"
     logger.info(f"Setting recomputation ratio to {recomp_ratio}")
 
     if use_disk:
@@ -77,8 +74,8 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         max_model_len=8000,
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
-        enforce_eager=True # disable torch compile
-        # tensor_parallel_size=2 # use more than one gpu for big models
+        enforce_eager=True, # disable torch compile
+        tensor_parallel_size=1 # use more than one gpu for big models
     )
 
     try:
@@ -222,8 +219,8 @@ def main():
     lmcache_connector = "LMCacheConnectorV1"
     model = "mistralai/Mistral-7B-Instruct-v0.2"
     # model = "mistralai/Mixtral-8x7B-Instruct-v0.1" # doesn't work
-    # model = "meta-llama/Llama-3.1-8B-Instruct" # nonsense tokenizer
-    # model = "meta-llama/Meta-Llama-3-8B-Instruct" # better but still kind of nonsense
+    # model = "meta-llama/Llama-3.1-8B-Instruct"
+    # model = "meta-llama/Meta-Llama-3-8B-Instruct"
     # model = "meta-llama/Llama-4-Scout-17B-16E-Instruct" # model too big
     
     # Setup environment

@@ -22,9 +22,9 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
+from lmcache.utils import _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
-
 
 class LMCBlender:
     """
@@ -50,7 +50,6 @@ class LMCBlender:
         self.common_metadata = LMCBlendCommonMetadata(
             check_layers=[1],
             recomp_ratios=[0.15],
-            # recomp_ratios=[0.3],
             thresholds=None,
         )
 
@@ -98,10 +97,10 @@ class LMCBlender:
 
             # TODO(Jiayi): remove `[0]` hardcode
             topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+            topk_num = max(topk_num, 1) # adding line for low recompute ratios (0.05)
 
             top_indices = torch.topk(diff_k, k=topk_num).indices
             top_indices, _ = torch.sort(top_indices)
-
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]
             residual = residual[top_indices]
